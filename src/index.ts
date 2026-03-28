@@ -90,7 +90,10 @@ async function matchWatchlist(db: D1Database, question: string): Promise<{ match
   const tags: string[] = [];
   const qLower = question.toLowerCase();
   for (const rule of rules.results || []) {
-    if (qLower.includes(rule.keyword.toLowerCase())) {
+    const kw = rule.keyword.toLowerCase();
+    // Use word boundary matching to avoid "Oilers" matching "oil"
+    const regex = new RegExp(`\\b${kw.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
+    if (regex.test(qLower)) {
       if (!tags.includes(rule.tag)) tags.push(rule.tag);
     }
   }
