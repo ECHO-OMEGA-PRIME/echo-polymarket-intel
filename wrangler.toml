@@ -1,0 +1,32 @@
+name = "echo-polymarket-intel"
+main = "src/index.ts"
+compatibility_date = "2024-12-01"
+compatibility_flags = ["nodejs_compat"]
+
+[triggers]
+# Every 10 minutes: poll Polymarket + crude oil prices
+crons = ["*/10 * * * *"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "echo-polymarket-intel"
+database_id = "5977d3c9-771e-478c-b7bf-0f90c60f13e5"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "34a01427098e4a0fb062dd9f80d4406f"
+
+[[services]]
+binding = "TELEGRAM"
+service = "echo-telegram"
+
+[[services]]
+binding = "SHARED_BRAIN"
+service = "echo-shared-brain"
+
+[[analytics_engine_datasets]]
+binding = "ANALYTICS"
+dataset = "echo_metrics"
+
+[vars]
+# ECHO_API_KEY → set via wrangler secret put
