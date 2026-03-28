@@ -15,6 +15,22 @@ const app = new Hono<{ Bindings: Env }>();
 const log = (level: string, msg: string, data?: Record<string, unknown>) =>
   console.log(JSON.stringify({ ts: new Date().toISOString(), level, worker: 'echo-polymarket-intel', msg, ...data }));
 
+// ── In-memory rate limiting (120 reads / 30 writes per IP per minute) ──
+const RL_MAP = new Map<string, { c: number; t: number }>();
+function isRateLimited(ip: string, isWrite: boolean): boolean {
+  const limit = isWrite ? 30 : 120;
+  const key = `${ip}:${isWrite ? 'w' : 'r'}`;
+  const now = Date.now();
+  const entry = RL_MAP.get(key);
+  if (!entry || now - entry.t > 60000) {
+    RL_MAP.set(key, { c: 1, t: now });
+    if (RL_MAP.size > 5000) { const first = RL_MAP.keys().next().value; if (first) RL_MAP.delete(first); }
+    return false;
+  }
+  entry.c++;
+  return entry.c > limit;
+}
+
 // ── Auth middleware ──────────────────────────────────────────────────────────
 function authRequired(c: any, next: any) {
   const key = c.req.header('X-Echo-API-Key') || c.req.query('key');
@@ -25,6 +41,18 @@ function authRequired(c: any, next: any) {
 }
 
 app.use('*', cors({ origin: ['https://echo-op.com', 'https://echo-prime-tech.vercel.app', 'https://echo-prime.tech'], credentials: true }));
+// Rate limiting middleware
+app.use('*', async (c, next) => {
+  const path = new URL(c.req.url).pathname;
+  if (path === '/health' || c.req.method === 'OPTIONS') return next();
+  const ip = c.req.header('cf-connecting-ip') || 'unknown';
+  const isWrite = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(c.req.method);
+  if (isRateLimited(ip, isWrite)) {
+    log('warn', 'Rate limited', { ip, method: c.req.method, path });
+    return c.json({ error: 'Rate limited' }, 429);
+  }
+  return next();
+});
 // Security headers middleware
 app.use('*', async (c, next) => {
   await next();
