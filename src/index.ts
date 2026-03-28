@@ -64,6 +64,15 @@ app.use('*', async (c, next) => {
 });
 
 
+// ── Root ──────────────────────────────────────────────────────────────────
+app.get('/', (c) => c.json({
+  service: 'echo-polymarket-intel',
+  version: '1.1.0',
+  status: 'operational',
+  description: 'Prediction Markets Intelligence — track 113+ markets, watchlist alerts, crude oil correlation, AI analysis',
+  endpoints: { health: '/health', dashboard: '/dashboard', markets: '/markets', alerts: '/alerts', oil: '/oil', stats: '/stats' },
+}));
+
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get('/health', async (c) => {
   try {
