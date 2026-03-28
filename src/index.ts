@@ -25,12 +25,27 @@ function authRequired(c: any, next: any) {
 }
 
 app.use('*', cors({ origin: ['https://echo-op.com', 'https://echo-prime-tech.vercel.app', 'https://echo-prime.tech'], credentials: true }));
+// Security headers middleware
+app.use('*', async (c, next) => {
+  await next();
+  c.res.headers.set('X-Content-Type-Options', 'nosniff');
+  c.res.headers.set('X-Frame-Options', 'DENY');
+  c.res.headers.set('X-XSS-Protection', '1; mode=block');
+  c.res.headers.set('Referrer-Policy', 'strict-origin-when-cross-origin');
+  c.res.headers.set('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+});
+
 
 // ── Health ──────────────────────────────────────────────────────────────────
 app.get('/health', async (c) => {
   try {
-    const r = await c.env.DB.prepare('SELECT COUNT(*) as cnt FROM markets').first<{ cnt: number }>();
-    return c.json({ status: 'healthy', worker: 'echo-polymarket-intel', version: '1.0.0', markets: r?.cnt || 0, timestamp: new Date().toISOString() });
+    const [markets, watchlist, alerts, oil] = await Promise.all([
+      c.env.DB.prepare('SELECT COUNT(*) as cnt FROM markets').first<{ cnt: number }>(),
+      c.env.DB.prepare('SELECT COUNT(*) as cnt FROM markets WHERE watchlist = 1').first<{ cnt: number }>(),
+      c.env.DB.prepare("SELECT COUNT(*) as cnt FROM alerts WHERE created_at > datetime('now', '-24 hours')").first<{ cnt: number }>(),
+      c.env.DB.prepare("SELECT COUNT(*) as cnt FROM crude_oil_prices WHERE recorded_at > datetime('now', '-24 hours')").first<{ cnt: number }>(),
+    ]);
+    return c.json({ status: 'healthy', worker: 'echo-polymarket-intel', version: '1.1.0', markets: markets?.cnt || 0, watchlist: watchlist?.cnt || 0, alerts_24h: alerts?.cnt || 0, oil_points: oil?.cnt || 0, timestamp: new Date().toISOString() });
   } catch (e) {
     return c.json({ status: 'degraded', error: String(e) }, 500);
   }
@@ -47,38 +62,71 @@ async function fetchPolymarkets(limit = 100, offset = 0): Promise<any[]> {
 }
 
 async function fetchCrudeOilPrice(): Promise<{ wti: number; brent: number; wti_change: number; brent_change: number } | null> {
+  // Source 1: Yahoo Finance v8 spark API (free, no auth, reliable)
   try {
-    // Use commodities-api.com free tier or fallback to scraping a public JSON feed
-    const res = await fetch('https://api.commodities-api.com/api/latest?access_key=free&base=USD&symbols=WTIOIL,BRENTOIL', {
-      headers: { 'User-Agent': 'EchoPolymarketIntel/1.0' },
+    const symbols = 'CL=F,BZ=F'; // WTI and Brent futures
+    const res = await fetch(`https://query1.finance.yahoo.com/v8/finance/spark?symbols=${symbols}&range=1d&interval=1d`, {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
     });
     if (res.ok) {
       const data: any = await res.json();
-      if (data?.data?.rates) {
-        // commodities-api returns inverse rates (1/price)
-        const wti = data.data.rates.WTIOIL ? 1 / data.data.rates.WTIOIL : 0;
-        const brent = data.data.rates.BRENTOIL ? 1 / data.data.rates.BRENTOIL : 0;
-        return { wti, brent, wti_change: 0, brent_change: 0 };
+      let wti = 0, brent = 0, wtiChange = 0, brentChange = 0;
+      // Yahoo returns: { "CL=F": { close: [price], chartPreviousClose: prevPrice } }
+      for (const sym of ['CL=F', 'BZ=F']) {
+        const entry = data?.[sym];
+        if (!entry) continue;
+        const close = Array.isArray(entry.close) ? entry.close[entry.close.length - 1] : (entry.close || 0);
+        const prevClose = entry.chartPreviousClose || entry.previousClose || close;
+        const changePct = prevClose > 0 ? ((close - prevClose) / prevClose) * 100 : 0;
+        if (sym === 'CL=F') { wti = close; wtiChange = changePct; }
+        if (sym === 'BZ=F') { brent = close; brentChange = changePct; }
+      }
+      if (wti > 0 || brent > 0) {
+        log('info', 'Oil prices from Yahoo Finance', { wti, brent, wtiChange, brentChange });
+        return { wti, brent, wti_change: wtiChange, brent_change: brentChange };
       }
     }
   } catch (e) {
-    log('warn', 'Commodities API failed, trying fallback', { error: String(e) });
+    log('warn', 'Yahoo Finance API failed, trying fallback', { error: String(e) });
   }
 
-  // Fallback: EIA open data API (free, no key needed for basic data)
+  // Source 2: Yahoo Finance v7 quote endpoint (alternate)
   try {
-    const res = await fetch('https://api.eia.gov/v2/petroleum/pri/spt/data/?api_key=DEMO_KEY&frequency=daily&data[0]=value&facets[series][]&sort[0][column]=period&sort[0][direction]=desc&length=2', {
+    const res = await fetch('https://query1.finance.yahoo.com/v7/finance/quote?symbols=CL=F,BZ=F&fields=regularMarketPrice,regularMarketChangePercent', {
+      headers: { 'User-Agent': 'Mozilla/5.0' },
+    });
+    if (res.ok) {
+      const data: any = await res.json();
+      const quotes = data?.quoteResponse?.result || [];
+      let wti = 0, brent = 0, wtiChange = 0, brentChange = 0;
+      for (const q of quotes) {
+        if (q.symbol === 'CL=F') { wti = q.regularMarketPrice || 0; wtiChange = q.regularMarketChangePercent || 0; }
+        if (q.symbol === 'BZ=F') { brent = q.regularMarketPrice || 0; brentChange = q.regularMarketChangePercent || 0; }
+      }
+      if (wti > 0 || brent > 0) return { wti, brent, wti_change: wtiChange, brent_change: brentChange };
+    }
+  } catch (e) {
+    log('warn', 'Yahoo v7 fallback also failed', { error: String(e) });
+  }
+
+  // Source 3: Marketstack free tier
+  try {
+    const res = await fetch('https://api.marketstack.com/v1/eod/latest?access_key=free&symbols=CL.COMM,BZ.COMM', {
       headers: { 'User-Agent': 'EchoPolymarketIntel/1.0' },
     });
     if (res.ok) {
       const data: any = await res.json();
-      if (data?.response?.data?.length) {
-        const latest = data.response.data[0];
-        return { wti: latest.value || 0, brent: 0, wti_change: 0, brent_change: 0 };
+      if (data?.data?.length) {
+        let wti = 0, brent = 0;
+        for (const d of data.data) {
+          if (d.symbol?.includes('CL')) wti = d.close || 0;
+          if (d.symbol?.includes('BZ')) brent = d.close || 0;
+        }
+        if (wti > 0 || brent > 0) return { wti, brent, wti_change: 0, brent_change: 0 };
       }
     }
   } catch (e) {
-    log('warn', 'EIA API fallback also failed', { error: String(e) });
+    log('warn', 'All oil price sources failed', { error: String(e) });
   }
 
   return null;
